@@ -131,7 +131,7 @@ static irqreturn_t kryos_irq_handler(int irq, void *dev_id)
 
     /*
      * Write sample into the slot at current head.
-     * Placeholder raw value — replace with real spi_sync() read.
+     * TODO: Currently a placeholder raw value — replace with real spi_sync() read.
      */
     rb->buffer[rb->head].raw       = 0xDEADBEEF;
     rb->buffer[rb->head].timestamp = ktime_get();
