@@ -10,3 +10,5 @@
 /Makefile
 /Module.symvers
 /build
+/...module-common.o.cmd
+/modules.order
