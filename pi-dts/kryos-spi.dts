@@ -1,0 +1,33 @@
+/dts-v1/;
+/plugin/;
+
+/ {
+    compatible = "brcm,bcm2711";
+
+    fragment@0 {
+        target = <&spidev0>;
+        __overlay__ {
+            status = "disabled";
+        };
+    };
+
+    fragment@1 {
+        target = <&spi0>;
+        __overlay__ {
+            #address-cells = <1>;
+            #size-cells = <0>;
+            status = "okay";
+
+            kryos_node: kryos-root-node@0 {
+                compatible = "rohit,kryos-root-node";
+                reg = <0>;
+                spi-max-frequency = <1000000>;
+                status = "okay";
+
+                interrupt-parent = <&gpio>;
+                interrupts = <25 2>;
+                interrupt-names = "kryos-irq";
+            };
+        };
+    };
+};

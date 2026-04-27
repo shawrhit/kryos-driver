@@ -1,0 +1,12 @@
+/.Module.symvers.cmd
+/.codex
+/.kryos_spi.ko.cmd
+/.kryos_spi.mod.cmd
+/.kryos_spi.mod.o.cmd
+/.kryos_spi.o.cmd
+/.module-common.o
+/.modules.order.cmd
+/.vscode
+/Makefile
+/Module.symvers
+/build
