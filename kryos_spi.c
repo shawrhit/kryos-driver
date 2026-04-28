@@ -14,7 +14,7 @@
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Rohit K. Shaw");
 MODULE_DESCRIPTION("KryOS SPI Kernel Driver");
-MODULE_VERSION("1.1");
+MODULE_VERSION("1.2");
 
 /* ─── Global sysfs handles ───────────────────────────────────────────────── */
 static struct class  *kryos_class;
@@ -24,8 +24,7 @@ static struct device *kryos_device;
 #define SPSC_SIZE 64        /* must be power of 2 */
 
 struct kryos_sample {
-    u32     raw;            /* raw sensor reading          */
-    ktime_t timestamp;      /* kernel timestamp of capture */
+    ktime_t timestamp;      /* kernel timestamp — captured in IRQ context */
 };
 
 struct kryos_spsc {
@@ -41,6 +40,7 @@ struct kryos_dev {
     struct workqueue_struct *wq;        /* dedicated workqueue          */
     struct work_struct       work;      /* work item queued by IRQ      */
     atomic_t                 dropped;   /* dropped sample counter       */
+    u32                      last_raw;  /* last successfully read value */
 };
 
 /* ─── Device Tree Match Table ────────────────────────────────────────────── */
@@ -62,15 +62,20 @@ static ssize_t telemetry_show(struct device *dev,
                                struct device_attribute *attr,
                                char *buf)
 {
+    struct kryos_dev *kdev = dev_get_drvdata(dev->parent);
+
+    if (!kdev)
+        return sysfs_emit(buf, "{\"error\":\"no device\"}\n");
+
     /*
-     * Placeholder — real implementation will read latest processed
-     * sample from kryos_dev and format it as JSON telemetry.
+     * Real implementation: format last_raw into JSON telemetry.
+     * last_raw is written by WQ handler after SPI read — safe to read here.
      */
     return sysfs_emit(buf,
-        "{\"round_id\":12345,\"ts\":\"2026-04-07T10:30:00\","
-        "\"temp_c\":4.125,\"node_mask\":\"1111\","
-        "\"rejected_mask\":\"0000\",\"quorum_ok\":true,"
-        "\"auth_ok\":true}\n");
+        "{\"raw\":\"0x%08x\","
+        "\"dropped\":%d}\n",
+        kdev->last_raw,
+        atomic_read(&kdev->dropped));
 }
 static DEVICE_ATTR_RO(telemetry);
 
@@ -79,7 +84,15 @@ static ssize_t dropped_show(struct device *dev,
                              struct device_attribute *attr,
                              char *buf)
 {
-    struct kryos_dev *kdev = dev_get_drvdata(dev);
+    /*
+     * dev here is the sysfs device (kryos_device).
+     * dev->parent is the SPI device which holds our kryos_dev via drvdata.
+     */
+    struct kryos_dev *kdev = dev_get_drvdata(dev->parent);
+
+    if (!kdev)
+        return sysfs_emit(buf, "-1\n");
+
     return sysfs_emit(buf, "%d\n", atomic_read(&kdev->dropped));
 }
 static DEVICE_ATTR_RO(dropped);
@@ -89,22 +102,36 @@ static void kryos_wq_handler(struct work_struct *work)
 {
     struct kryos_dev  *dev = container_of(work, struct kryos_dev, work);
     struct kryos_spsc *rb  = &dev->rb;
+    u8                 rx_buf[4];
+    int                ret;
 
     /*
-     * WQ owns tail — read directly, no READ_ONCE needed.
-     * IRQ owns head — always READ_ONCE to prevent compiler caching.
+     * Drain all pending slots from the ring buffer.
+     * WQ owns tail — read directly.
+     * IRQ owns head — always READ_ONCE.
      */
     while (rb->tail != READ_ONCE(rb->head)) {
         struct kryos_sample *sample = &rb->buffer[rb->tail];
 
-        pr_info("KryOS: sample raw=0x%08x ts=%lld\n",
-                sample->raw,
-                ktime_to_ns(sample->timestamp));
+        /*
+         * SPI read happens here in process context — safe to sleep,
+         * safe to use DMA, safe to take locks.
+         * IRQ handler only timestamps the event — actual data
+         * is fetched here after the interrupt signals readiness.
+         */
+        ret = spi_read(dev->spi, rx_buf, sizeof(rx_buf));
+        if (ret) {
+            pr_err_ratelimited("KryOS: spi_read failed: %d\n", ret);
+        } else {
+            dev->last_raw = be32_to_cpup((__be32 *)rx_buf);
+            pr_info("KryOS: sample raw=0x%08x ts=%lld ns\n",
+                    dev->last_raw,
+                    ktime_to_ns(sample->timestamp));
+        }
 
         /*
-         * Ensure sample is fully consumed before advancing tail.
-         * smp_store_release acts as a write barrier — IRQ sees
-         * updated tail only after we are done with the sample.
+         * Advance tail — smp_store_release ensures sample is fully
+         * consumed before IRQ sees the updated tail index.
          */
         smp_store_release(&rb->tail,
                           (rb->tail + 1) & (SPSC_SIZE - 1));
@@ -114,13 +141,13 @@ static void kryos_wq_handler(struct work_struct *work)
 /* ─── IRQ Handler (atomic context) ──────────────────────────────────────── */
 static irqreturn_t kryos_irq_handler(int irq, void *dev_id)
 {
-    struct kryos_dev  *dev      = dev_id;
-    struct kryos_spsc *rb       = &dev->rb;
+    struct kryos_dev  *dev       = dev_id;
+    struct kryos_spsc *rb        = &dev->rb;
     unsigned int       next_head = (rb->head + 1) & (SPSC_SIZE - 1);
 
     /*
-     * Check if buffer is full.
-     * READ_ONCE on tail — WQ owns tail and may update it concurrently.
+     * Check buffer full.
+     * READ_ONCE on tail — WQ owns tail and updates it concurrently.
      */
     if (next_head == READ_ONCE(rb->tail)) {
         atomic_inc(&dev->dropped);
@@ -130,29 +157,20 @@ static irqreturn_t kryos_irq_handler(int irq, void *dev_id)
     }
 
     /*
-     * Write sample into the slot at current head.
-     * TODO: Currently a placeholder raw value — replace with real spi_sync() read.
+     * Capture timestamp only — NO spi_read here.
+     * spi_read sleeps and uses DMA — strictly forbidden in IRQ context.
+     * The actual SPI transfer is deferred to the workqueue handler.
      */
+    rb->buffer[rb->head].timestamp = ktime_get();
 
-     // Dummy write to buffer to demonstrate ordering — ensures timestamp is after raw value in memory
-    /* rb->buffer[rb->head].raw       = 0xDEADBEEF;
-    rb->buffer[rb->head].timestamp = ktime_get(); */
-
-    // Simulate SPI read of 4 bytes into rx_buf, convert to big-endian u32, and store in ring buffer
-    u8 rx_buf[4];
-    spi_read(dev->spi, rx_buf, sizeof(rx_buf));
-    rb->buffer[rb->head].raw = be32_to_cpup((__be32 *)rx_buf);
     /*
-     * Publish the new head to the consumer.
-     * smp_store_release ensures sample is fully written before
-     * head is updated — WQ cannot see the new head until data is ready.
+     * Publish new head to consumer.
+     * smp_store_release — WQ cannot see new head until timestamp is written.
      */
     smp_store_release(&rb->head, next_head);
 
-    /* Kick the workqueue to consume the new sample */
+    /* Kick workqueue to perform SPI read and process sample */
     queue_work(dev->wq, &dev->work);
-
-    pr_info_ratelimited("KryOS: IRQ %d fired, head=%u\n", irq, rb->head);
 
     return IRQ_HANDLED;
 }
@@ -163,14 +181,14 @@ static int kryos_probe(struct spi_device *spi)
     struct kryos_dev *dev;
     int ret;
 
-    /* Allocate per-device state — devm handles free on device removal */
+    /* Allocate per-device state — devm frees on device removal */
     dev = devm_kzalloc(&spi->dev, sizeof(*dev), GFP_KERNEL);
     if (!dev) {
         pr_err("KryOS: failed to allocate device state\n");
         return -ENOMEM;
     }
 
-    /* Wire up back-pointer and store dev in spi_device for retrieval */
+    /* Wire back-pointer, store dev for retrieval via spi_get_drvdata */
     dev->spi = spi;
     spi_set_drvdata(spi, dev);
 
@@ -178,14 +196,18 @@ static int kryos_probe(struct spi_device *spi)
     atomic_set(&dev->dropped, 0);
     INIT_WORK(&dev->work, kryos_wq_handler);
 
-    /* Create a dedicated single-threaded workqueue for this device */
+    /* Dedicated single-threaded workqueue for this device */
     dev->wq = alloc_workqueue("kryos_wq", WQ_UNBOUND, 1);
     if (!dev->wq) {
         pr_err("KryOS: failed to create workqueue\n");
         return -ENOMEM;
     }
 
-    /* Create sysfs device: /sys/class/kryos/kryos_device/ */
+    /*
+     * Create sysfs device: /sys/class/kryos/kryos_device/
+     * Pass dev as drvdata — retrieved in sysfs show functions
+     * via dev_get_drvdata(dev->parent).
+     */
     kryos_device = device_create(kryos_class, &spi->dev,
                                   MKDEV(0, 0), dev, "kryos_device");
     if (IS_ERR(kryos_device)) {
@@ -194,14 +216,14 @@ static int kryos_probe(struct spi_device *spi)
         goto err_destroy_wq;
     }
 
-    /* Create /sys/class/kryos/kryos_device/telemetry */
+    /* /sys/class/kryos/kryos_device/telemetry */
     ret = device_create_file(kryos_device, &dev_attr_telemetry);
     if (ret) {
         pr_err("KryOS: failed to create telemetry sysfs file\n");
         goto err_destroy_device;
     }
 
-    /* Create /sys/class/kryos/kryos_device/dropped */
+    /* /sys/class/kryos/kryos_device/dropped */
     ret = device_create_file(kryos_device, &dev_attr_dropped);
     if (ret) {
         pr_err("KryOS: failed to create dropped sysfs file\n");
@@ -217,7 +239,8 @@ static int kryos_probe(struct spi_device *spi)
 
     /*
      * Register IRQ handler.
-     * Pass dev not spi — handler casts dev_id back to kryos_dev *.
+     * Pass dev — handler casts dev_id back to kryos_dev *.
+     * Must match free_irq call in remove.
      */
     ret = request_irq(spi->irq, kryos_irq_handler,
                       IRQF_TRIGGER_FALLING, "kryos", dev);
@@ -247,15 +270,15 @@ static void kryos_remove(struct spi_device *spi)
 {
     struct kryos_dev *dev = spi_get_drvdata(spi);
 
-    /* Stop IRQ first — no new work after this */
+    /* Stop IRQ first — no new items queued after this */
     if (spi->irq > 0)
         free_irq(spi->irq, dev);
 
-    /* Drain and destroy workqueue — waits for running work to finish */
+    /* Flush and destroy WQ — waits for any running work to complete */
     flush_workqueue(dev->wq);
     destroy_workqueue(dev->wq);
 
-    /* Tear down sysfs */
+    /* Tear down sysfs in reverse order */
     device_remove_file(kryos_device, &dev_attr_dropped);
     device_remove_file(kryos_device, &dev_attr_telemetry);
     device_destroy(kryos_class, MKDEV(0, 0));
@@ -281,8 +304,8 @@ static int __init kryos_init(void)
     int ret;
 
     /*
-     * Create class first — probe runs immediately on spi_register_driver
-     * if a matching device exists, so class must exist before registration.
+     * Class must exist before spi_register_driver —
+     * probe runs immediately if matching device is already present.
      */
     kryos_class = class_create("kryos");
     if (IS_ERR(kryos_class)) {
