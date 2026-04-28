@@ -133,9 +133,15 @@ static irqreturn_t kryos_irq_handler(int irq, void *dev_id)
      * Write sample into the slot at current head.
      * TODO: Currently a placeholder raw value — replace with real spi_sync() read.
      */
-    rb->buffer[rb->head].raw       = 0xDEADBEEF;
-    rb->buffer[rb->head].timestamp = ktime_get();
 
+     // Dummy write to buffer to demonstrate ordering — ensures timestamp is after raw value in memory
+    /* rb->buffer[rb->head].raw       = 0xDEADBEEF;
+    rb->buffer[rb->head].timestamp = ktime_get(); */
+
+    // Simulate SPI read of 4 bytes into rx_buf, convert to big-endian u32, and store in ring buffer
+    u8 rx_buf[4];
+    spi_read(dev->spi, rx_buf, sizeof(rx_buf));
+    rb->buffer[rb->head].raw = be32_to_cpup((__be32 *)rx_buf);
     /*
      * Publish the new head to the consumer.
      * smp_store_release ensures sample is fully written before
