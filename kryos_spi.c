@@ -34,13 +34,24 @@ struct kryos_spsc {
 };
 
 /* ─── Per-device State ───────────────────────────────────────────────────── */
+/* ─── Payload Structure (15 bytes, little-endian) ──────────────────────── */
+typedef struct __attribute__((packed)) {
+    uint32_t round_id;
+    uint32_t timestamp;
+    uint32_t temp_raw;      /* temperature as IEEE 754 float (stored as raw bits) */
+    uint8_t node_mask;
+    uint8_t rejected_mask;
+    uint8_t status_flags;
+} payload_t;
+
+/* ─── Per-device State ───────────────────────────────────────────────────── */
 struct kryos_dev {
-    struct spi_device       *spi;       /* back-pointer to SPI device   */
-    struct kryos_spsc        rb;        /* SPSC ring buffer, embedded   */
-    struct workqueue_struct *wq;        /* dedicated workqueue          */
-    struct work_struct       work;      /* work item queued by IRQ      */
-    atomic_t                 dropped;   /* dropped sample counter       */
-    u32                      last_raw;  /* last successfully read value */
+    struct spi_device       *spi;           /* back-pointer to SPI device  */
+    struct kryos_spsc        rb;            /* SPSC ring buffer, embedded  */
+    struct workqueue_struct *wq;            /* dedicated workqueue         */
+    struct work_struct       work;          /* work item queued by IRQ     */
+    atomic_t                 dropped;       /* dropped sample counter      */
+    payload_t                last_payload;  /* last parsed payload         */
 };
 
 /* ─── Device Tree Match Table ────────────────────────────────────────────── */
@@ -57,24 +68,43 @@ static const struct spi_device_id kryos_spi_ids[] = {
 };
 MODULE_DEVICE_TABLE(spi, kryos_spi_ids);
 
-/* ─── sysfs: telemetry ───────────────────────────────────────────────────── */
 static ssize_t telemetry_show(struct device *dev,
                                struct device_attribute *attr,
                                char *buf)
 {
     struct kryos_dev *kdev = dev_get_drvdata(dev->parent);
+    uint32_t temp_raw;
+    int temp_int, temp_frac;
 
     if (!kdev)
         return sysfs_emit(buf, "{\"error\":\"no device\"}\n");
 
     /*
-     * Real implementation: format last_raw into JSON telemetry.
-     * last_raw is written by WQ handler after SPI read — safe to read here.
+     * Format last_payload as JSON telemetry.
+     * temp_raw is IEEE 754 float stored as raw bits—no FP ops in kernel.
+     * Decode in userspace or format as hex here.
      */
+    temp_raw = kdev->last_payload.temp_raw;
+    
+    /* Simple approximation: treat raw as fixed-point for display */
+    /* For proper IEEE 754 decoding, use userspace tools */
+    temp_int = temp_raw >> 8;       /* rough scale, for demo only */
+    temp_frac = (temp_raw & 0xFF) * 1000 / 256;
+    
     return sysfs_emit(buf,
-        "{\"raw\":\"0x%08x\","
+        "{\"round_id\":%u,"
+        "\"timestamp\":%u,"
+        "\"temp_raw\":\"0x%08x\","
+        "\"node_mask\":\"0x%02x\","
+        "\"rejected_mask\":\"0x%02x\","
+        "\"status_flags\":\"0x%02x\","
         "\"dropped\":%d}\n",
-        kdev->last_raw,
+        kdev->last_payload.round_id,
+        kdev->last_payload.timestamp,
+        kdev->last_payload.temp_raw,
+        kdev->last_payload.node_mask,
+        kdev->last_payload.rejected_mask,
+        kdev->last_payload.status_flags,
         atomic_read(&kdev->dropped));
 }
 static DEVICE_ATTR_RO(telemetry);
@@ -102,7 +132,7 @@ static void kryos_wq_handler(struct work_struct *work)
 {
     struct kryos_dev  *dev = container_of(work, struct kryos_dev, work);
     struct kryos_spsc *rb  = &dev->rb;
-    u8                 rx_buf[4];
+    u8                 rx_buf[15];
     int                ret;
 
     /*
@@ -123,9 +153,15 @@ static void kryos_wq_handler(struct work_struct *work)
         if (ret) {
             pr_err_ratelimited("KryOS: spi_read failed: %d\n", ret);
         } else {
-            dev->last_raw = be32_to_cpup((__be32 *)rx_buf);
-            pr_info("KryOS: sample raw=0x%08x ts=%lld ns\n",
-                    dev->last_raw,
+            /* Cast and parse 15-byte payload structure (little-endian) */
+            payload_t *payload = (payload_t *)rx_buf;
+            dev->last_payload = *payload;
+            
+            /* No FP ops in kernel — just log raw values */
+            pr_info("KryOS: round_id=%u temp_raw=0x%08x status=0x%02x ts=%lld ns\n",
+                    payload->round_id,
+                    payload->temp_raw,
+                    payload->status_flags,
                     ktime_to_ns(sample->timestamp));
         }
 
