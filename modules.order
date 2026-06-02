@@ -1,1 +1,1 @@
-/home/shawrhit/Documents/CodeWorks/kryos-driver/kryos_spi.o
+/home/shawrhit/Documents/CodeWorks/kryos_driver/kryos_spi.o

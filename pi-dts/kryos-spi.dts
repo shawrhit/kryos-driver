@@ -23,7 +23,7 @@
                 spi-max-frequency = <1000000>;
                 status = "okay";
                 interrupt-parent = <&gpio>;
-                interrupts = <25 2>;
+                interrupts = <4 2>; /* GPIO 4, Falling Edge (2) */
                 interrupt-names = "kryos-irq";
                 pinctrl-names = "default";
                 pinctrl-0 = <&kryos_irq_pins>;
@@ -35,9 +35,9 @@
         target = <&gpio>;
         __overlay__ {
             kryos_irq_pins: kryos_irq_pins {
-                brcm,pins = <25>;
+                brcm,pins = <4>;       /* GPIO 4 (Physical Pin 7) */
                 brcm,function = <0>;    /* input */
-                brcm,pull = <2>;        /* 2 = pull-up */
+                brcm,pull = <2>;        /* pull-up */
             };
         };
     };
